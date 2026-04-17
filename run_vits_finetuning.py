@@ -2,6 +2,9 @@
 Fine-tuning Vits for TTS.
 """
 
+from dotenv import load_dotenv
+load_dotenv("/home/hillary/trainingTTS/.env")
+
 import logging
 import math
 import os
@@ -118,6 +121,43 @@ class ModelArguments:
         metadata={
             "help": (
                 "If `True`, it will resize the token embeddings based on the vocabulary size of the tokenizer. In other words, use this when you use a different tokenizer than the one that was used during pretraining."
+            )
+        },
+    )
+
+    freeze_text_encoder: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If `True`, freeze the text encoder during finetuning. This preserves the pretrained "
+                "phoneme representations and is recommended when finetuning on a new speaker."
+            )
+        },
+    )
+
+    freeze_duration_predictor: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If `True`, freeze the duration predictor during finetuning."
+            )
+        },
+    )
+
+    freeze_posterior_encoder: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If `True`, freeze the posterior encoder during finetuning."
+            )
+        },
+    )
+
+    freeze_flow: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If `True`, freeze the flow module during finetuning."
             )
         },
     )
@@ -587,13 +627,16 @@ def main():
     # 4. Load dataset
     raw_datasets = DatasetDict()
 
+    # Use token from args, or fall back to HF_TOKEN env var
+    _hf_token = model_args.token or os.environ.get("HF_TOKEN")
+
     if training_args.do_train:
         raw_datasets["train"] = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
             split=data_args.train_split_name,
             cache_dir=model_args.cache_dir,
-            token=model_args.token,
+            token=_hf_token,
         )
 
     if training_args.do_eval:
@@ -602,7 +645,7 @@ def main():
             data_args.dataset_config_name,
             split=data_args.eval_split_name,
             cache_dir=model_args.cache_dir,
-            token=model_args.token,
+            token=_hf_token,
         )
 
     if data_args.audio_column_name not in next(iter(raw_datasets.values())).column_names:
@@ -800,14 +843,34 @@ def main():
     # 8. Load pretrained model,
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
-    model = VitsModelForPreTraining.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
+    #
+    # IMPORTANT: We use manual load_state_dict instead of from_pretrained() because
+    # transformers v5's from_pretrained() calls _init_weights() AFTER loading weights,
+    # which reinitializes nn.Linear, nn.Embedding, and nn.LayerNorm parameters,
+    # destroying the pretrained text_encoder weights. This was the root cause of the
+    # "freeze not working" bug in V3 training.
+    from safetensors.torch import load_file as _load_safetensors
+    from huggingface_hub import hf_hub_download as _hf_download
+
+    model = VitsModelForPreTraining(config)
+    _model_path = model_args.model_name_or_path
+    _sf_local = os.path.join(_model_path, 'model.safetensors') if os.path.isdir(_model_path) else None
+    if _sf_local and os.path.isfile(_sf_local):
+        _sd = _load_safetensors(_sf_local)
+    else:
+        _sf_path = _hf_download(
+            _model_path, 'model.safetensors',
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+        )
+        _sd = _load_safetensors(_sf_path)
+    _result = model.load_state_dict(_sd, strict=False)
+    if _result.missing_keys:
+        logger.warning(f"Missing keys when loading pretrained model: {_result.missing_keys}")
+    if _result.unexpected_keys:
+        logger.info(f"Unexpected keys when loading (can be ignored): {len(_result.unexpected_keys)} keys")
+    del _sd  # free memory
 
     
     with training_args.main_process_first(desc="apply_weight_norm"):
@@ -958,9 +1021,40 @@ def main():
             disc.apply_weight_norm()
     del model.discriminator
 
+    # Freeze specified modules
+    frozen_modules = []
+    if model_args.freeze_text_encoder:
+        for param in model.text_encoder.parameters():
+            param.requires_grad = False
+        frozen_modules.append("text_encoder")
+    if model_args.freeze_duration_predictor:
+        for param in model.duration_predictor.parameters():
+            param.requires_grad = False
+        frozen_modules.append("duration_predictor")
+    if model_args.freeze_posterior_encoder:
+        for param in model.posterior_encoder.parameters():
+            param.requires_grad = False
+        frozen_modules.append("posterior_encoder")
+    if model_args.freeze_flow:
+        for param in model.flow.parameters():
+            param.requires_grad = False
+        frozen_modules.append("flow")
+
+    # Log frozen/trainable parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+    logger.info(f"Frozen parameters: {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+    if frozen_modules:
+        logger.info(f"Frozen modules: {', '.join(frozen_modules)}")
+    else:
+        logger.info("No modules frozen - all parameters are trainable")
+
     # init gen_optimizer, gen_lr_scheduler, disc_optimizer, dics_lr_scheduler
     gen_optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         training_args.learning_rate,
         betas=[training_args.adam_beta1, training_args.adam_beta2],
         eps=training_args.adam_epsilon,
@@ -1096,7 +1190,7 @@ def main():
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                     labels_attention_mask=batch["labels_attention_mask"],
-                    speaker_id=batch["speaker_id"],
+                    speaker_id=batch.get("speaker_id"),
                     return_dict=True,
                     monotonic_alignment_function=maximum_path,
                 )
@@ -1285,7 +1379,7 @@ def main():
                             attention_mask=batch["attention_mask"],
                             labels=batch["labels"],
                             labels_attention_mask=batch["labels_attention_mask"],
-                            speaker_id=batch["speaker_id"],
+                            speaker_id=batch.get("speaker_id"),
                             return_dict=True,
                             monotonic_alignment_function=maximum_path,
                         )
@@ -1387,7 +1481,7 @@ def main():
                         attention_mask=batch["attention_mask"],
                         labels=batch["labels"],
                         labels_attention_mask=batch["labels_attention_mask"],
-                        speaker_id=batch["speaker_id"],
+                        speaker_id=batch.get("speaker_id"),
                         return_dict=True,
                         monotonic_alignment_function=maximum_path,
                     )
